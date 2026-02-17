@@ -124,6 +124,11 @@ Discord periodically rebuilds its frontend. If the plugin stops working:
 
 ---
 
+## 🖼️ Preview
+
+![Plugin Preview](./proof.png)
+
+
 ## 📄 License
 
 MIT
