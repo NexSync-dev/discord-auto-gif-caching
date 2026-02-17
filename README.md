@@ -49,17 +49,8 @@ Equicord/
             └── index.tsx   ← this file
 ```
 
-**4. Set your author ID**
 
-Open `index.tsx` and replace the `id: 0n` with your Discord user ID as a BigInt:
-```ts
-authors: [
-    { name: "YourName", id: 123456789012345678n },
-],
-```
-To get your ID: enable **Developer Mode** in Discord settings → right-click your username → **Copy User ID**.
-
-**5. Build and inject**
+**4. Build and inject**
 ```bash
 pnpm build
 pnpm inject
@@ -67,7 +58,7 @@ pnpm inject
 
 Select your Discord install when prompted (Stable / PTB / Canary).
 
-**6. Restart Discord**
+**5. Restart Discord**
 
 Fully quit Discord (right-click tray icon → Quit) and relaunch it.
 
