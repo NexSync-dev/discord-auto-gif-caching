@@ -2,7 +2,6 @@
 
 A plugin for [Equicord](https://github.com/Equicord/Equicord) / [Vencord](https://github.com/Vendicated/Vencord) that caches your favorited GIFs locally so they load instantly instead of re-fetching from Discord's CDN every time.
 
-![Plugin settings showing cache inspector with entry count, total size, and a table of cached GIFs](.github/preview.png)
 
 ---
 
