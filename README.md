@@ -43,7 +43,7 @@ Fully restart Discord, then enable the plugin under **Settings → Plugins → G
 
 ---
 
-## Caveats
+## known issues
 
 Tenor proxy URLs (`images-ext-1.discordapp.net`) are skipped because Discord's proxy blocks cross-origin fetches. Direct Tenor URLs (`media.tenor.com`) and Discord attachment GIFs work fine.
 
