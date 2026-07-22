@@ -11,6 +11,11 @@ const MEMORY_CACHE = new Map<string, string>();
 const REVERSE_CACHE = new Map<string, string>();
 const FAVORITE_KEYS = new Set<string>();
 const LAST_ACCESS = new Map<string, number>();
+const PENDING_CACHE = new Map<string, Promise<string | null>>();
+
+let pauseCaching = false;
+let dbInstance: IDBDatabase | null = null;
+let dbPromise: Promise<IDBDatabase> | null = null;
 
 const settings = definePluginSettings({
     preloadOnStartup: {
@@ -33,33 +38,44 @@ const settings = definePluginSettings({
     },
 });
 
+function normalizeUrl(url: string): string {
+    return url.startsWith("//") ? "https:" + url : url;
+}
+
 function extractProxiedUrl(url: string): string | null {
     try {
         const u = new URL(url);
         if (!/discordapp\.net$|discord\.com$/.test(u.hostname)) return null;
+        
         const m = u.pathname.match(/\/external\/[^/]+\/(https?)\/(.+)$/);
         if (!m) return null;
-        return `${m[1]}://${m[2]}`;
+        
+        return `${m[1]}://${m[2]}${u.search}`;
     } catch {
         return null;
     }
 }
 
-function normalizeUrl(url: string): string {
-    return url.startsWith("//") ? "https:" + url : url;
-}
-
 function canonicalUrl(url: string): string {
     const n = normalizeUrl(url);
-    return extractProxiedUrl(n) ?? n;
+    const extracted = extractProxiedUrl(n) ?? n;
+    try {
+        const u = new URL(extracted);
+        return `${u.origin}${u.pathname}`;
+    } catch {
+        return extracted;
+    }
 }
 
 function isCacheable(url: string): boolean {
     return !!url && !url.startsWith("blob:") && !url.startsWith("data:");
 }
 
-function openDB(): Promise<IDBDatabase> {
-    return new Promise((resolve, reject) => {
+function getDB(): Promise<IDBDatabase> {
+    if (dbInstance) return Promise.resolve(dbInstance);
+    if (dbPromise) return dbPromise;
+
+    dbPromise = new Promise((resolve, reject) => {
         const req = indexedDB.open(DB_NAME, DB_VERSION);
         req.onupgradeneeded = () => {
             const db = req.result;
@@ -72,28 +88,45 @@ function openDB(): Promise<IDBDatabase> {
             if (!store.indexNames.contains("cachedAt")) store.createIndex("cachedAt", "cachedAt", { unique: false });
             if (!store.indexNames.contains("lastAccessed")) store.createIndex("lastAccessed", "lastAccessed", { unique: false });
         };
-        req.onsuccess = () => resolve(req.result);
-        req.onerror = () => reject(req.error);
+        req.onsuccess = () => {
+            dbInstance = req.result;
+            dbInstance.onversionchange = () => {
+                dbInstance?.close();
+                dbInstance = null;
+                dbPromise = null;
+            };
+            resolve(dbInstance);
+        };
+        req.onerror = () => {
+            dbPromise = null;
+            reject(req.error);
+        };
+        req.onblocked = () => {
+            console.warn("[GifFavCache] IndexedDB open blocked");
+        };
     });
+    return dbPromise;
 }
 
 interface DbEntry { url: string; blob: Blob; cachedAt: number; lastAccessed: number; }
 
 async function dbGet(url: string): Promise<DbEntry | undefined> {
     try {
-        const db = await openDB();
+        const db = await getDB();
         return await new Promise((resolve, reject) => {
             const tx = db.transaction(STORE_NAME, "readonly");
             const req = tx.objectStore(STORE_NAME).get(url);
-            req.onsuccess = () => resolve(req.result);
+            req.onsuccess = () => resolve(req.result as DbEntry | undefined);
             req.onerror = () => reject(req.error);
         });
-    } catch { return undefined; }
+    } catch {
+        return undefined;
+    }
 }
 
 async function dbPut(url: string, blob: Blob): Promise<void> {
     try {
-        const db = await openDB();
+        const db = await getDB();
         const now = Date.now();
         await new Promise<void>((resolve, reject) => {
             const tx = db.transaction(STORE_NAME, "readwrite");
@@ -101,12 +134,14 @@ async function dbPut(url: string, blob: Blob): Promise<void> {
             tx.oncomplete = () => resolve();
             tx.onerror = () => reject(tx.error);
         });
-    } catch (e) { console.error("[GifFavCache] dbPut failed", e); }
+    } catch (e) {
+        console.error("[GifFavCache] dbPut failed", e);
+    }
 }
 
 async function dbDelete(url: string): Promise<void> {
     try {
-        const db = await openDB();
+        const db = await getDB();
         await new Promise<void>((resolve, reject) => {
             const tx = db.transaction(STORE_NAME, "readwrite");
             tx.objectStore(STORE_NAME).delete(url);
@@ -118,26 +153,30 @@ async function dbDelete(url: string): Promise<void> {
 
 async function dbGetAll(): Promise<DbEntry[]> {
     try {
-        const db = await openDB();
+        const db = await getDB();
         return await new Promise((resolve, reject) => {
             const tx = db.transaction(STORE_NAME, "readonly");
             const req = tx.objectStore(STORE_NAME).getAll();
-            req.onsuccess = () => resolve(req.result as any[]);
+            req.onsuccess = () => resolve(req.result as DbEntry[]);
             req.onerror = () => reject(req.error);
         });
-    } catch { return []; }
+    } catch {
+        return [];
+    }
 }
 
 async function dbClearAll(): Promise<void> {
     try {
-        const db = await openDB();
+        const db = await getDB();
         await new Promise<void>((resolve, reject) => {
             const tx = db.transaction(STORE_NAME, "readwrite");
             tx.objectStore(STORE_NAME).clear();
             tx.oncomplete = () => resolve();
             tx.onerror = () => reject(tx.error);
         });
-    } catch (e) { console.error("[GifFavCache] dbClearAll failed", e); }
+    } catch (e) {
+        console.error("[GifFavCache] dbClearAll failed", e);
+    }
 }
 
 function formatBytes(bytes: number): string {
@@ -160,34 +199,46 @@ async function cacheGif(rawUrl: string): Promise<string | null> {
     if (!isCacheable(rawUrl)) return null;
     const key = canonicalUrl(rawUrl);
 
-    if (MEMORY_CACHE.has(key)) { touch(key); return MEMORY_CACHE.get(key)!; }
-
-    const dbEntry = await dbGet(key);
-    if (dbEntry?.blob) {
-        const objUrl = URL.createObjectURL(dbEntry.blob);
-        MEMORY_CACHE.set(key, objUrl);
-        REVERSE_CACHE.set(objUrl, key);
+    if (MEMORY_CACHE.has(key)) {
         touch(key);
-        return objUrl;
+        return MEMORY_CACHE.get(key)!;
     }
 
-    try {
-        const res = await fetch(key, { mode: "cors" });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const blob = await res.blob();
-        await dbPut(key, blob);
-        await pruneCache();
-        const objUrl = URL.createObjectURL(blob);
-        MEMORY_CACHE.set(key, objUrl);
-        REVERSE_CACHE.set(objUrl, key);
-        touch(key);
-        console.log("[GifFavCache] Cached:", key);
-        swapAllMatchingElements(key, objUrl);
-        return objUrl;
-    } catch (e) {
-        console.warn("[GifFavCache] Failed to cache:", key, e);
-        return null;
-    }
+    if (PENDING_CACHE.has(key)) return PENDING_CACHE.get(key)!;
+
+    const promise = (async () => {
+        try {
+            const dbEntry = await dbGet(key);
+            if (dbEntry?.blob) {
+                const objUrl = URL.createObjectURL(dbEntry.blob);
+                MEMORY_CACHE.set(key, objUrl);
+                REVERSE_CACHE.set(objUrl, key);
+                touch(key);
+                return objUrl;
+            }
+
+            const res = await fetch(rawUrl, { mode: "cors" });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const blob = await res.blob();
+            await dbPut(key, blob);
+            await pruneCache();
+            const objUrl = URL.createObjectURL(blob);
+            MEMORY_CACHE.set(key, objUrl);
+            REVERSE_CACHE.set(objUrl, key);
+            touch(key);
+            console.log("[GifFavCache] Cached:", key);
+            swapAllMatchingElements(key, objUrl);
+            return objUrl;
+        } catch (e) {
+            console.warn("[GifFavCache] Failed to cache:", key, e);
+            return null;
+        } finally {
+            PENDING_CACHE.delete(key);
+        }
+    })();
+
+    PENDING_CACHE.set(key, promise);
+    return promise;
 }
 
 async function pruneCache(): Promise<void> {
@@ -198,22 +249,20 @@ async function pruneCache(): Promise<void> {
     const toDelete = all.slice(0, all.length - max);
     for (const entry of toDelete) {
         await dbDelete(entry.url);
-        const objUrl = MEMORY_CACHE.get(entry.url);
-        if (objUrl) { URL.revokeObjectURL(objUrl); REVERSE_CACHE.delete(objUrl); MEMORY_CACHE.delete(entry.url); }
-        LAST_ACCESS.delete(entry.url);
     }
 }
 
-const UserSettingsProtoStore = findStoreLazy("UserSettingsProtoStore");
+const UserSettingsProtoStore = findStoreLazy("UserSettingsProtoStore") as any;
 
 function getFavoriteGifRawUrls(): string[] {
     try {
         const gifs = UserSettingsProtoStore?.frecencyWithoutFetchingLatest?.favoriteGifs?.gifs;
         if (!gifs) return [];
         const urls = new Set<string>();
-        for (const g of Object.values(gifs) as any[]) {
-            if (typeof g?.src === "string" && g.src) urls.add(g.src);
-            if (typeof g?.url === "string" && g.url) urls.add(g.url);
+        for (const g of Object.values(gifs)) {
+            const item = g as any;
+            if (typeof item?.src === "string" && item.src) urls.add(item.src);
+            if (typeof item?.url === "string" && item.url) urls.add(item.url);
         }
         return [...urls];
     } catch (e) {
@@ -230,7 +279,10 @@ function refreshFavoriteKeys(urls: string[]) {
 async function preloadAllFavorites(): Promise<void> {
     const urls = getFavoriteGifRawUrls();
     refreshFavoriteKeys(urls);
-    if (!urls.length) { console.log("[GifFavCache] No favorites found yet."); return; }
+    if (!urls.length) {
+        console.log("[GifFavCache] No favorites found yet.");
+        return;
+    }
     console.log(`[GifFavCache] Preloading ${urls.length} favorited GIFs...`);
     const BATCH = 4;
     for (let i = 0; i < urls.length; i += BATCH) {
@@ -239,24 +291,40 @@ async function preloadAllFavorites(): Promise<void> {
     console.log("[GifFavCache] Preload complete.");
 }
 
-let refreshTimer: ReturnType<typeof setInterval> | null = null;
-function startAutoRefresh() {
+let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleAutoRefresh() {
     stopAutoRefresh();
     const mins = settings.store.refreshIntervalMinutes;
     if (!mins || mins <= 0) return;
-    refreshTimer = setInterval(() => preloadAllFavorites(), mins * 60_000);
+    refreshTimer = setTimeout(async () => {
+        await preloadAllFavorites();
+        scheduleAutoRefresh();
+    }, mins * 60_000);
 }
+
 function stopAutoRefresh() {
-    if (refreshTimer !== null) { clearInterval(refreshTimer); refreshTimer = null; }
+    if (refreshTimer !== null) {
+        clearTimeout(refreshTimer);
+        refreshTimer = null;
+    }
 }
 
 const TAG_SELECTOR = "img[src], video[src], source[src]";
 
 function trySwapElement(el: Element) {
     const src = el.getAttribute("src");
-    if (!src || src.startsWith("blob:") || src.startsWith("data:")) return;
+    if (!src) return;
 
-    const key = canonicalUrl(normalizeUrl(src));
+    if (src.startsWith("blob:")) {
+        const key = REVERSE_CACHE.get(src);
+        if (key) {
+            touch(key);
+        }
+        return;
+    }
+    if (src.startsWith("data:")) return;
+
+    const key = canonicalUrl(src);
     const cached = MEMORY_CACHE.get(key);
     if (cached) {
         if (el.getAttribute("src") !== cached) el.setAttribute("src", cached);
@@ -264,7 +332,7 @@ function trySwapElement(el: Element) {
         return;
     }
 
-    if (FAVORITE_KEYS.has(key)) {
+    if (FAVORITE_KEYS.has(key) && !pauseCaching) {
         cacheGif(src).then(objUrl => {
             if (objUrl && el.isConnected && el.getAttribute("src") === src) {
                 el.setAttribute("src", objUrl);
@@ -277,7 +345,9 @@ function swapAllMatchingElements(key: string, objUrl: string) {
     document.querySelectorAll(TAG_SELECTOR).forEach(el => {
         const src = el.getAttribute("src");
         if (!src) return;
-        if (canonicalUrl(normalizeUrl(src)) === key) el.setAttribute("src", objUrl);
+        if (src !== objUrl && canonicalUrl(src) === key) {
+            el.setAttribute("src", objUrl);
+        }
     });
 }
 
@@ -285,6 +355,8 @@ let mutationObserver: MutationObserver | null = null;
 
 function startDomWatcher() {
     stopDomWatcher();
+    if (typeof document === "undefined") return;
+
     mutationObserver = new MutationObserver(mutations => {
         for (const m of mutations) {
             if (m.type === "attributes" && m.target instanceof Element) {
@@ -312,6 +384,15 @@ function stopDomWatcher() {
     mutationObserver = null;
 }
 
+function swapAllToOriginalUrls() {
+    document.querySelectorAll(TAG_SELECTOR).forEach(el => {
+        const src = el.getAttribute("src");
+        if (src && REVERSE_CACHE.has(src)) {
+            el.setAttribute("src", REVERSE_CACHE.get(src)!);
+        }
+    });
+}
+
 interface CacheEntry { url: string; size: number; cachedAt: number; }
 
 function CacheInspector() {
@@ -321,20 +402,33 @@ function CacheInspector() {
     const [preloading, setPreloading] = React.useState(false);
     const [status, setStatus] = React.useState<string | null>(null);
     const [quota, setQuota] = React.useState<{ usage: number; quota: number } | null>(null);
+    const [storeFound, setStoreFound] = React.useState(false);
 
     const totalSize = entries.reduce((acc, e) => acc + e.size, 0);
-    const storeFound = !!UserSettingsProtoStore;
     const favoriteCount = FAVORITE_KEYS.size;
 
     async function load() {
         setLoading(true);
         setStatus(null);
+        try {
+            const store = UserSettingsProtoStore as any;
+            if (store?.frecencyWithoutFetchingLatest?.favoriteGifs?.gifs) {
+                setStoreFound(true);
+            } else {
+                setStoreFound(false);
+            }
+        } catch {
+            setStoreFound(false);
+        }
+
         const all = await dbGetAll();
         setEntries(all.map(e => ({ url: e.url, size: e.blob.size, cachedAt: e.cachedAt }))
             .sort((a, b) => b.cachedAt - a.cachedAt));
         if (navigator.storage?.estimate) {
-            const est = await navigator.storage.estimate();
-            setQuota({ usage: est.usage ?? 0, quota: est.quota ?? 0 });
+            try {
+                const est = await navigator.storage.estimate();
+                setQuota({ usage: est.usage ?? 0, quota: est.quota ?? 0 });
+            } catch { }
         }
         setLoading(false);
     }
@@ -342,7 +436,11 @@ function CacheInspector() {
     async function clearCache() {
         if (!confirm("Clear the entire GIF cache? This will re-download GIFs next time you view your favorites.")) return;
         setClearing(true);
+        pauseCaching = true;
         await dbClearAll();
+
+        swapAllToOriginalUrls();
+
         for (const objUrl of MEMORY_CACHE.values()) URL.revokeObjectURL(objUrl);
         MEMORY_CACHE.clear();
         REVERSE_CACHE.clear();
@@ -350,15 +448,27 @@ function CacheInspector() {
         setEntries([]);
         setClearing(false);
         setStatus("✅ Cache cleared!");
+        setTimeout(() => { pauseCaching = false; }, 5000);
     }
 
     async function deleteEntry(url: string) {
+        pauseCaching = true;
         await dbDelete(url);
         const objUrl = MEMORY_CACHE.get(url);
-        if (objUrl) { URL.revokeObjectURL(objUrl); REVERSE_CACHE.delete(objUrl); MEMORY_CACHE.delete(url); }
+        if (objUrl) {
+            document.querySelectorAll(TAG_SELECTOR).forEach(el => {
+                if (el.getAttribute("src") === objUrl) {
+                    el.setAttribute("src", url);
+                }
+            });
+            URL.revokeObjectURL(objUrl);
+            REVERSE_CACHE.delete(objUrl);
+            MEMORY_CACHE.delete(url);
+        }
         LAST_ACCESS.delete(url);
         setEntries(prev => prev.filter(e => e.url !== url));
         setStatus("🗑️ Deleted 1 entry");
+        setTimeout(() => { pauseCaching = false; }, 5000);
     }
 
     async function preloadNow() {
@@ -370,7 +480,38 @@ function CacheInspector() {
         setStatus("✅ Preload finished");
     }
 
-    React.useEffect(() => { load(); }, []);
+    React.useEffect(() => {
+        let isMounted = true;
+        const doLoad = async () => {
+            setLoading(true);
+            setStatus(null);
+            try {
+                const store = UserSettingsProtoStore as any;
+                if (store?.frecencyWithoutFetchingLatest?.favoriteGifs?.gifs) {
+                    if (isMounted) setStoreFound(true);
+                } else {
+                    if (isMounted) setStoreFound(false);
+                }
+            } catch {
+                if (isMounted) setStoreFound(false);
+            }
+
+            const all = await dbGetAll();
+            if (!isMounted) return;
+            setEntries(all.map(e => ({ url: e.url, size: e.blob.size, cachedAt: e.cachedAt }))
+                .sort((a, b) => b.cachedAt - a.cachedAt));
+            if (navigator.storage?.estimate) {
+                try {
+                    const est = await navigator.storage.estimate();
+                    if (!isMounted) return;
+                    setQuota({ usage: est.usage ?? 0, quota: est.quota ?? 0 });
+                } catch { }
+            }
+            if (isMounted) setLoading(false);
+        };
+        doLoad();
+        return () => { isMounted = false; };
+    }, []);
 
     const styles: Record<string, React.CSSProperties> = {
         wrap: { fontFamily: "monospace", fontSize: 12, color: "var(--text-normal)" },
@@ -451,11 +592,13 @@ function CacheInspector() {
     );
 }
 
+let preloadTimeout: ReturnType<typeof setTimeout> | null = null;
+
 export default definePlugin({
     name: "GifFavCache",
     description: "Caches your favorited GIFs locally (memory + IndexedDB) and swaps them in the moment they'd render, for instant loading.",
     authors: [
-        { name: "ns5h", id: 1278368743331991646 },
+        { name: "ns5h", id: 1278368743331991646n },
     ],
     settings,
 
@@ -465,7 +608,7 @@ export default definePlugin({
 
     resolveUrl(src: string): string {
         if (!src || src.startsWith("blob:")) return src;
-        const key = canonicalUrl(normalizeUrl(src));
+        const key = canonicalUrl(src);
         const cached = MEMORY_CACHE.get(key);
         if (cached) return cached;
         cacheGif(src).catch(console.error);
@@ -477,15 +620,15 @@ export default definePlugin({
         return REVERSE_CACHE.get(src) ?? src;
     },
 
-    _onFavAdded: null as any,
-    _onProtoUpdate: null as any,
+    _onFavAdded: null as ((event: any) => void) | null,
+    _onProtoUpdate: null as (() => void) | null,
 
     async start() {
         this._onFavAdded = (event: any) => {
             const src = event?.gif?.src ?? event?.gif?.url;
             if (src) {
                 console.log("[GifFavCache] New favorite, caching:", src);
-                FAVORITE_KEYS.add(canonicalUrl(normalizeUrl(src)));
+                FAVORITE_KEYS.add(canonicalUrl(src));
                 cacheGif(src).catch(console.error);
             }
         };
@@ -494,8 +637,10 @@ export default definePlugin({
             const urls = getFavoriteGifRawUrls();
             refreshFavoriteKeys(urls);
             for (const url of urls) {
-                const key = canonicalUrl(normalizeUrl(url));
-                if (!MEMORY_CACHE.has(key)) cacheGif(url).catch(console.error);
+                const key = canonicalUrl(url);
+                if (!MEMORY_CACHE.has(key) && !PENDING_CACHE.has(key)) {
+                    cacheGif(url).catch(console.error);
+                }
             }
         };
 
@@ -503,8 +648,10 @@ export default definePlugin({
         FluxDispatcher.subscribe("USER_SETTINGS_PROTO_UPDATE", this._onProtoUpdate);
 
         startDomWatcher();
-        if (settings.store.preloadOnStartup) setTimeout(() => preloadAllFavorites(), 5000);
-        startAutoRefresh();
+        if (settings.store.preloadOnStartup) {
+            preloadTimeout = setTimeout(() => preloadAllFavorites(), 5000);
+        }
+        scheduleAutoRefresh();
         console.log("[GifFavCache] Started.");
     },
 
@@ -513,11 +660,20 @@ export default definePlugin({
         if (this._onProtoUpdate) FluxDispatcher.unsubscribe("USER_SETTINGS_PROTO_UPDATE", this._onProtoUpdate);
         stopAutoRefresh();
         stopDomWatcher();
+        if (preloadTimeout) {
+            clearTimeout(preloadTimeout);
+            preloadTimeout = null;
+        }
+
+        swapAllToOriginalUrls();
+
         for (const objUrl of MEMORY_CACHE.values()) URL.revokeObjectURL(objUrl);
         MEMORY_CACHE.clear();
         REVERSE_CACHE.clear();
         FAVORITE_KEYS.clear();
         LAST_ACCESS.clear();
+        PENDING_CACHE.clear();
+        pauseCaching = false;
         console.log("[GifFavCache] Stopped.");
     },
 });
